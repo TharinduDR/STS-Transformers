@@ -5,7 +5,7 @@ TEMP_DIRECTORY = "temp/data"
 RESULT_FILE = "result.tsv"
 RESULT_IMAGE = "result.jpg"
 MODEL_TYPE = "bert"
-MODEL_NAME = "bert-large-cased"
+MODEL_NAME = "bert-base-cased"
 
 transformer_config = {
     'output_dir': 'temp/outputs/',
