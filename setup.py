@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name="ststransformers",
-    version="0.0.1-beta",
+    version="0.0.1",
     author="Tharindu Ranasinghe",
     author_email="rhtdranasinghe@gmail.com",
     description="An easy-to-use wrapper library for the Transformers library for Semantic Textual Similrity Tasks.",
