@@ -29,9 +29,9 @@ setup(
         "transformers",
         "scipy",
         "scikit-learn",
-        "seqeval",
         "tensorboardx",
         "pandas",
         "tokenizers",
+        "wandb"
     ],
 )
