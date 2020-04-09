@@ -9,7 +9,7 @@ Please refer to [PyTorch installation page](https://pytorch.org/get-started/loca
 When PyTorch has been installed, you can install from source by cloning the repository and running:
 
 ```bash
-git clone https://github.com/TharinduDR/STSTransformers.git
+git clone https://github.com/TharinduDR/STS-Transformers.git
 cd TransQuest
 pip install -r requirements.txt
 ``` 

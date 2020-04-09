@@ -53,7 +53,7 @@ from models.roberta_model import RobertaForSequenceClassification
 from models.xlm_model import XLMForSequenceClassification
 from models.xlm_roberta_model import XLMRobertaForSequenceClassification
 from models.xlnet_model import XLNetForSequenceClassification
-from utils import InputExample, convert_examples_to_features
+from algo.utils import InputExample, convert_examples_to_features
 
 try:
     import wandb

@@ -4,7 +4,7 @@ import pandas as pd
 from config.transformer_config import transformer_config, MODEL_TYPE, MODEL_NAME
 from evaluation import pearson_corr, spearman_corr
 from normalizer import fit
-from transformer_model import TrnsformerModel
+from algo.transformer_model import TrnsformerModel
 
 
 train = pd.read_csv("data/stsbenchmark/sts-train-dev.csv", usecols=[4, 5, 6], names=['labels', 'text_a', 'text_b'], sep='\t', engine="python", quotechar='"', error_bad_lines=False )
