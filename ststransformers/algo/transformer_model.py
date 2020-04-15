@@ -45,15 +45,15 @@ from transformers import (
     FlaubertTokenizer,
 )
 
+from ststransformers.algo.utils import InputExample, convert_examples_to_features
 from ststransformers.models.albert_model import AlbertForSequenceClassification
-from ststransformers.models import BertForSequenceClassification
-from ststransformers.models import CamembertForSequenceClassification
+from ststransformers.models.bert_model import BertForSequenceClassification
+from ststransformers.models.camembert_model import CamembertForSequenceClassification
 from ststransformers.models.distilbert_model import DistilBertForSequenceClassification
-from ststransformers.models import RobertaForSequenceClassification
+from ststransformers.models.roberta_model import RobertaForSequenceClassification
 from ststransformers.models.xlm_model import XLMForSequenceClassification
 from ststransformers.models.xlm_roberta_model import XLMRobertaForSequenceClassification
-from ststransformers.models import XLNetForSequenceClassification
-from ststransformers.algo import InputExample, convert_examples_to_features
+from ststransformers.models.xlnet_model import XLNetForSequenceClassification
 
 try:
     import wandb
