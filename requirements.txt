@@ -9,3 +9,5 @@ scipy==1.4.1
 scikit-learn==0.22.2.post1
 tensorboardX==2.0
 wandb==0.8.29
+farasapy==0.0.5
+PyArabic==0.6.8
