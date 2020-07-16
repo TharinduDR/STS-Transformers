@@ -7,6 +7,7 @@ SUBMISSION_FILE = "predictions.txt"
 RESULT_IMAGE = "result.jpg"
 GOOGLE_DRIVE = False
 DRIVE_FILE_ID = None
+SEGMENT = True
 MODEL_TYPE = "xlmroberta"
 MODEL_NAME = "xlm-roberta-large"
 
