@@ -9,7 +9,7 @@ from ststransformers.util.evaluation import pearson_corr, spearman_corr
 from ststransformers.algo.transformer_model import STSTransformerModel
 
 from examples.arabic_sts.config.transformer_config import TEMP_DIRECTORY, transformer_config, MODEL_TYPE, MODEL_NAME, \
-    SEED
+    SEED, SEGMENT, RESULT_IMAGE
 from examples.arabic_sts.normalizer import fit, un_fit
 from examples.arabic_sts.reader import concatenate
 import numpy as np
@@ -19,15 +19,24 @@ from examples.arabic_sts.draw import print_stat, draw_scatterplot
 if not os.path.exists(TEMP_DIRECTORY):
     os.makedirs(TEMP_DIRECTORY)
 
-FILE_DIRECTORY = "data"
-data = concatenate(FILE_DIRECTORY)
-data = data[['text_a', 'text_b', 'labels']].dropna()
+TRAIN_FILE_DIRECTORY = "data/train"
+TEST_FILE_DIRECTORY = "data/test"
+
+train = concatenate(TRAIN_FILE_DIRECTORY)
+train = train[['text_a', 'text_b', 'labels']].dropna()
+
+print(train.shape[0])
+
+test = read_test(TEST_FILE_DIRECTORY)
+print(test.shape[0])
 
 if SEGMENT:
-    data['text_a'] = data['text_a'].apply(segment)
-    data['text_b'] = data['text_b'].apply(segment)
+    train['text_a'] = train['text_a'].apply(segment)
+    train['text_b'] = train['text_b'].apply(segment)
 
-train, test = train_test_split(data, test_size=0.2)
+    test['text_a'] = test['text_a'].apply(segment)
+    test['text_b'] = test['text_b'].apply(segment)
+
 
 test_sentence_pairs = list(map(list, zip(test['text_a'].to_list(), test['text_b'].to_list())))
 
@@ -76,5 +85,5 @@ else:
 
 
 test = un_fit(test, 'predictions')
-draw_scatterplot(dev, 'labels', 'predictions', os.path.join(TEMP_DIRECTORY, RESULT_IMAGE), "Arabic STS")
+draw_scatterplot(test, 'labels', 'predictions', os.path.join(TEMP_DIRECTORY, RESULT_IMAGE), "Arabic STS")
 print_stat(test, 'labels', 'predictions')

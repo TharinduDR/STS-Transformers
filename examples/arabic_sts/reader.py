@@ -15,3 +15,14 @@ def concatenate(path):
 
     return df
 
+
+def read_test(path):
+    df = pd.read_csv(os.path.join(path, "STS.input.track1.ar-ar.txt"), sep='\t', header=None, names=["text_a", "text_b"],
+                                     quoting=csv.QUOTE_NONE)
+    with open(os.path.join(path, "STS.gs.track1.ar-ar.txt")) as f:
+        gs = f.read().splitlines()
+
+    gs = map(float, gs)
+    df["labels"] = gs
+
+    return df

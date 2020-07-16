@@ -4,12 +4,12 @@ SEED = 777
 TEMP_DIRECTORY = "temp/data"
 RESULT_FILE = "result.tsv"
 SUBMISSION_FILE = "predictions.txt"
-RESULT_IMAGE = "result.jpg"
+RESULT_IMAGE = "result.png"
 GOOGLE_DRIVE = False
 DRIVE_FILE_ID = None
 SEGMENT = True
-MODEL_TYPE = "xlmroberta"
-MODEL_NAME = "xlm-roberta-large"
+MODEL_TYPE = "bert"
+MODEL_NAME = "aubmindlab/bert-base-arabert"
 
 transformer_config = {
     'output_dir': 'temp/outputs/',
@@ -31,16 +31,16 @@ transformer_config = {
     'max_grad_norm': 1.0,
     'do_lower_case': False,
 
-    'logging_steps': 100,
-    'save_steps': 100,
+    'logging_steps': 50,
+    'save_steps': 50,
     "no_cache": False,
     "no_save": False,
     "save_recent_only": True,
     'save_model_every_epoch': False,
     'n_fold': 3,
-    'evaluate_during_training': False,
+    'evaluate_during_training': True,
     "evaluate_during_training_silent": False,
-    'evaluate_during_training_steps': 100,
+    'evaluate_during_training_steps': 50,
     "evaluate_during_training_verbose": True,
     'use_cached_eval_features': False,
     "save_best_model": True,
