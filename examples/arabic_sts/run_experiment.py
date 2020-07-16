@@ -11,7 +11,7 @@ from ststransformers.algo.transformer_model import STSTransformerModel
 from examples.arabic_sts.config.transformer_config import TEMP_DIRECTORY, transformer_config, MODEL_TYPE, MODEL_NAME, \
     SEED, SEGMENT, RESULT_IMAGE
 from examples.arabic_sts.normalizer import fit, un_fit
-from examples.arabic_sts.reader import concatenate
+from examples.arabic_sts.reader import concatenate, read_test
 import numpy as np
 from examples.arabic_sts.arabic_preprocess import segment
 from examples.arabic_sts.draw import print_stat, draw_scatterplot

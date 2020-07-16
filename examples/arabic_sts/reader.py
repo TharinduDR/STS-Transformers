@@ -22,7 +22,7 @@ def read_test(path):
     with open(os.path.join(path, "STS.gs.track1.ar-ar.txt")) as f:
         gs = f.read().splitlines()
 
-    gs = map(float, gs)
+    gs = list(map(float, gs))
     df["labels"] = gs
 
     return df
