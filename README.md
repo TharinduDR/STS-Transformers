@@ -13,3 +13,7 @@ git clone https://github.com/TharinduDR/STS-Transformers.git
 cd TransQuest
 pip install -r requirements.txt
 ``` 
+
+## Pretrained Models
+
+### Arabic
