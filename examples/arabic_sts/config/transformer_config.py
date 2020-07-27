@@ -7,9 +7,9 @@ SUBMISSION_FILE = "predictions.txt"
 RESULT_IMAGE = "result.png"
 GOOGLE_DRIVE = False
 DRIVE_FILE_ID = None
-SEGMENT = False
+SEGMENT = True
 MODEL_TYPE = "bert"
-MODEL_NAME = "aubmindlab/bert-base-arabertv01"
+MODEL_NAME = "aubmindlab/bert-base-arabert"
 
 transformer_config = {
     'output_dir': 'temp/outputs/',
