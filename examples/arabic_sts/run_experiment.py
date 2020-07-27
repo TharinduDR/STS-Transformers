@@ -19,8 +19,8 @@ from examples.arabic_sts.draw import print_stat, draw_scatterplot
 if not os.path.exists(TEMP_DIRECTORY):
     os.makedirs(TEMP_DIRECTORY)
 
-TRAIN_FILE_DIRECTORY = "examples/arabic_sts/data/train"
-TEST_FILE_DIRECTORY = "examples/arabic_sts/data/test"
+TRAIN_FILE_DIRECTORY = "data/train"
+TEST_FILE_DIRECTORY = "data/test"
 
 train = concatenate(TRAIN_FILE_DIRECTORY)
 train = train[['text_a', 'text_b', 'labels']].dropna()
