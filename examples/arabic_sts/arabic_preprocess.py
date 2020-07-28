@@ -78,7 +78,7 @@ redundant_punct_pattern = (
     r"([!\"#\$%\'\(\)\*\+,\.:;\-<=·>?@\[\\\]\^_ـ`{\|}~—٪’،؟`୍“؛”ۚ【»؛\s+«–…‘]{2,})"
 )
 
-farasa_segmenter = FarasaSegmenter()
+farasa_segmenter = FarasaSegmenter(interactive=True)
 
 
 def remove_elongation(word):

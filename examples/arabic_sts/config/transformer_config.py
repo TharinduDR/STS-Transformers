@@ -7,9 +7,9 @@ SUBMISSION_FILE = "predictions.txt"
 RESULT_IMAGE = "result.png"
 GOOGLE_DRIVE = False
 DRIVE_FILE_ID = None
-SEGMENT = True
-MODEL_TYPE = "bert"
-MODEL_NAME = "aubmindlab/bert-base-arabert"
+SEGMENT = False
+MODEL_TYPE = "xlmroberta"
+MODEL_NAME = "xlm-roberta-large"
 
 transformer_config = {
     'output_dir': 'temp/outputs/',
