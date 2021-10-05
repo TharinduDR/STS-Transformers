@@ -1,3 +1,5 @@
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Downloads](https://static.pepy.tech/badge/ststransformers)](https://pepy.tech/project/ststransformerst)
+
 # STSTransformers : Transformer based Semantic Textual Similrity. 
 
 STSTransformers provides state-of-the-art models for Semantic Textual Similarity.
