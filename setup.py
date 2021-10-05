@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name="ststransformers",
-    version="0.0.3",
+    version="0.0.4",
     author="Tharindu Ranasinghe",
     author_email="rhtdranasinghe@gmail.com",
     description="An easy-to-use wrapper library for the Transformers library for Semantic Textual Similrity Tasks.",
@@ -24,14 +24,18 @@ setup(
     install_requires=[
         "numpy",
         "requests",
-        "tqdm",
+        "tqdm>=4.47.0",
         "regex",
-        "transformers",
+        "transformers>=4.2.0",
         "scipy",
         "scikit-learn",
         "tensorboardx",
         "pandas",
         "tokenizers",
-        "wandb"
+        "matplotlib",
+        "wandb",
+        "sentencepiece",
+        "onnxruntime",
+        "seqeval",
     ],
 )
