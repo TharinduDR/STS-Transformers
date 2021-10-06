@@ -1006,17 +1006,6 @@ class STSTransformerModel:
                         if args.wandb_project or self.is_sweeping:
                             wandb.log(self._get_last_metrics(training_progress_scores))
 
-                        for key, value in flatten_results(
-                            self._get_last_metrics(training_progress_scores)
-                        ):
-                            try:
-                                tb_writer.add_scalar(key, value, global_step)
-                            except (NotImplementedError, AssertionError):
-                                if verbose:
-                                    logger.warning(
-                                        f"can't log value of type: {type(value)} to tensorboar"
-                                    )
-                        tb_writer.flush()
 
                         if not best_eval_metric:
                             best_eval_metric = results[args.early_stopping_metric]
@@ -2282,60 +2271,6 @@ class STSTransformerModel:
 
     def _create_training_progress_scores(self, multi_label, **kwargs):
         return collections.defaultdict(list)
-        """extra_metrics = {key: [] for key in kwargs}
-        if multi_label:
-            training_progress_scores = {
-                "global_step": [],
-                "LRAP": [],
-                "train_loss": [],
-                "eval_loss": [],
-                **extra_metrics,
-            }
-        else:
-            if self.model.num_labels == 2:
-                if self.args.sliding_window:
-                    training_progress_scores = {
-                        "global_step": [],
-                        "tp": [],
-                        "tn": [],
-                        "fp": [],
-                        "fn": [],
-                        "mcc": [],
-                        "train_loss": [],
-                        "eval_loss": [],
-                        **extra_metrics,
-                    }
-                else:
-                    training_progress_scores = {
-                        "global_step": [],
-                        "tp": [],
-                        "tn": [],
-                        "fp": [],
-                        "fn": [],
-                        "mcc": [],
-                        "train_loss": [],
-                        "eval_loss": [],
-                        "auroc": [],
-                        "auprc": [],
-                        **extra_metrics,
-                    }
-            elif self.model.num_labels == 1:
-                training_progress_scores = {
-                    "global_step": [],
-                    "train_loss": [],
-                    "eval_loss": [],
-                    **extra_metrics,
-                }
-            else:
-                training_progress_scores = {
-                    "global_step": [],
-                    "mcc": [],
-                    "train_loss": [],
-                    "eval_loss": [],
-                    **extra_metrics,
-                }
-
-        return training_progress_scores"""
 
     def save_model(
         self, output_dir=None, optimizer=None, scheduler=None, model=None, results=None
