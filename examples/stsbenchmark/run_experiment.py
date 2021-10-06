@@ -18,10 +18,7 @@ model = STSTransformerModel(MODEL_TYPE, MODEL_NAME, num_labels=1, use_cuda=torch
                             args=transformer_config)
 
 
-model.train_model(train, eval_df=eval_df, pearson_corr=pearson_corr, spearman_corr=spearman_corr,
-                          mae=mean_absolute_error)
+model.train_model(train, eval_df=eval_df, pearson_corr=pearson_corr, spearman_corr=spearman_corr)
 model = STSTransformerModel(MODEL_TYPE, transformer_config["best_model_dir"], num_labels=1,
                             use_cuda=torch.cuda.is_available(), args=transformer_config)
-result, model_outputs, wrong_predictions = model.eval_model(eval_df, pearson_corr=pearson_corr,
-                                                                    spearman_corr=spearman_corr,
-                                                                    mae=mean_absolute_error)
+result, model_outputs, wrong_predictions = model.eval_model(eval_df, pearson_corr=pearson_corr, spearman_corr=spearman_corr)
