@@ -1,5 +1,5 @@
 import torch.nn as nn
-from transformers.modeling_distilbert import DistilBertModel, DistilBertPreTrainedModel
+from transformers import DistilBertPreTrainedModel, DistilBertModel
 
 
 class DistilBertForSequenceClassification(DistilBertPreTrainedModel):

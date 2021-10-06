@@ -1,6 +1,7 @@
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss, MSELoss
-from transformers.modeling_xlnet import XLNetModel, XLNetPreTrainedModel, SequenceSummary
+from transformers import XLNetModel
+from transformers.modeling_utils import SequenceSummary
 
 
 class XLNetForSequenceClassification(XLNetPreTrainedModel):

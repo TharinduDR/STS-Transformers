@@ -1,9 +1,14 @@
+import torch
+import torch.nn as nn
 from torch.nn import CrossEntropyLoss, MSELoss
-from transformers import XLMPreTrainedModel, XLMModel
-from transformers.modeling_utils import SequenceSummary
+from transformers.models.electra.modeling_electra import (
+    ElectraModel,
+    ElectraPreTrainedModel,
+    ElectraClassificationHead,
+)
 
 
-class XLMForSequenceClassification(XLMPreTrainedModel):
+class ElectraForSequenceClassification(ElectraPreTrainedModel):
     r"""
         **labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
             Labels for computing the sequence classification/regression loss.
@@ -23,48 +28,59 @@ class XLMForSequenceClassification(XLMPreTrainedModel):
             list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
     Examples::
-        tokenizer = XLMTokenizer.from_pretrained('xlm-mlm-en-2048')
-        model = XLMForSequenceClassification.from_pretrained('xlm-mlm-en-2048')
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForSequenceClassification.from_pretrained('bert-base-uncased')
         input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
         labels = torch.tensor([1]).unsqueeze(0)  # Batch size 1
         outputs = model(input_ids, labels=labels)
         loss, logits = outputs[:2]
-    """
+    """  # noqa: ignore flake8"
 
     def __init__(self, config, weight=None):
-        super(XLMForSequenceClassification, self).__init__(config)
+        super(ElectraForSequenceClassification, self).__init__(config)
         self.num_labels = config.num_labels
-        self.weight = weight
 
-        self.transformer = XLMModel(config)
-        self.sequence_summary = SequenceSummary(config)
+        self.bert = ElectraModel(config)
+        self.classifier = ElectraClassificationHead(config)
 
         self.init_weights()
 
-    def forward(self, input_ids=None, attention_mask=None, langs=None, token_type_ids=None, position_ids=None,
-                lengths=None, cache=None, head_mask=None, inputs_embeds=None, labels=None):
-        transformer_outputs = self.transformer(input_ids,
-                                               attention_mask=attention_mask,
-                                               langs=langs,
-                                               token_type_ids=token_type_ids,
-                                               position_ids=position_ids,
-                                               lengths=lengths,
-                                               cache=cache,
-                                               head_mask=head_mask)
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+    ):
 
-        output = transformer_outputs[0]
-        logits = self.sequence_summary(output)
+        discriminator_hidden_states = self.electra(
+            input_ids,
+            attention_mask,
+            token_type_ids,
+            position_ids,
+            head_mask,
+            inputs_embeds,
+        )
 
-        outputs = (logits,) + transformer_outputs[1:]  # Keep new_mems and attention/hidden states if they are here
+        sequence_output = discriminator_hidden_states[0]
+        logits = self.classifier(sequence_output)
 
+        loss = None
         if labels is not None:
             if self.num_labels == 1:
                 #  We are doing regression
                 loss_fct = MSELoss()
                 loss = loss_fct(logits.view(-1), labels.view(-1))
             else:
-                loss_fct = CrossEntropyLoss(weight=self.weight)
+                if self.weight is not None:
+                    weight = self.weight.to(labels.device)
+                else:
+                    weight = None
+                loss_fct = CrossEntropyLoss(weight=weight)
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            outputs = (loss,) + outputs
 
-        return outputs
+        output = (logits,) + discriminator_hidden_states[1:]
+        return ((loss,) + output) if loss is not None else output

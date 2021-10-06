@@ -1,6 +1,4 @@
-from transformers import XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST
-from transformers.configuration_xlm_roberta import XLMRobertaConfig
-
+from transformers import XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST, XLMRobertaConfig
 
 from ststransformers.models.roberta_model import RobertaForSequenceClassification
 
