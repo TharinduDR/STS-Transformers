@@ -12,3 +12,4 @@ pandas
 tokenizers
 wandb>=0.10.32
 sentencepiece
+tensorboardX
