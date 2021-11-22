@@ -6,10 +6,10 @@ with open("README.md", "r") as fh:
 
 setup(
     name="ststransformers",
-    version="0.0.4",
+    version="0.0.5",
     author="Tharindu Ranasinghe",
     author_email="rhtdranasinghe@gmail.com",
-    description="An easy-to-use wrapper library for the Transformers library for Semantic Textual Similarity Tasks.",
+    description="An easy-to-use wrapper library for using Transformers in Semantic Textual Similarity Tasks.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/TharinduDR/STS-Transformers",
@@ -32,9 +32,9 @@ setup(
         "scikit-learn",
         "seqeval",
         "tensorboard",
+        "tensorboardX",
         "pandas",
         "tokenizers",
-        "wandb>=0.10.32",
         "wandb>=0.10.32",
         "sentencepiece",
     ],
