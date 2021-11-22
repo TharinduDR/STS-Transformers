@@ -78,7 +78,6 @@ from transformers import (
     SqueezeBertConfig,
     SqueezeBertForSequenceClassification,
     SqueezeBertTokenizerFast,
-    WEIGHTS_NAME,
     XLMConfig,
     XLMRobertaConfig,
     XLMRobertaTokenizerFast,
@@ -114,7 +113,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class MonoTransQuestModel:
+class STSTransformerModel:
     def __init__(
             self,
             model_type,
