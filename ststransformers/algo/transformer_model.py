@@ -3,47 +3,30 @@
 
 
 from __future__ import absolute_import, division, print_function
-import collections
+
+import glob
 import logging
 import math
 import os
 import random
+import shutil
+import tempfile
 import warnings
 from dataclasses import asdict
-from multiprocessing import cpu_count
-import tempfile
 from pathlib import Path
 
-from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import mode, pearsonr
-from scipy.special import softmax
+from scipy.stats import mode
 from sklearn.metrics import (
     confusion_matrix,
     label_ranking_average_precision_score,
     matthews_corrcoef,
-    mean_squared_error,
-    roc_curve,
-    auc,
-    average_precision_score,
 )
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn import CrossEntropyLoss
+from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
-from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm, trange
-from tqdm.contrib import tenumerate
-from transformers.optimization import (
-    get_constant_schedule,
-    get_constant_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-    get_cosine_with_hard_restarts_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup,
-)
-from transformers.optimization import AdamW, Adafactor
 from transformers import (
     AlbertConfig,
     AlbertTokenizer,
@@ -107,11 +90,19 @@ from transformers import (
     XLNetForSequenceClassification,
 )
 from transformers.convert_graph_to_onnx import convert, quantize
+from transformers.optimization import AdamW, Adafactor
+from transformers.optimization import (
+    get_constant_schedule,
+    get_constant_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_cosine_with_hard_restarts_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
+)
 
 from ststransformers.algo.model_args import ClassificationArgs
-from ststransformers.algo.utils import load_hf_dataset, LazyClassificationDataset, InputExample, \
-    sweep_config_to_sweep_values, flatten_results, convert_examples_to_features, ClassificationDataset
-from ststransformers.losses.loss_utils import init_loss
+from ststransformers.algo.utils import sweep_config_to_sweep_values, InputExample, LazyClassificationDataset, \
+    convert_examples_to_features
 
 try:
     import wandb
@@ -123,52 +114,26 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-MODELS_WITHOUT_CLASS_WEIGHTS_SUPPORT = ["squeezebert", "deberta", "mpnet"]
-
-MODELS_WITH_EXTRA_SEP_TOKEN = [
-    "roberta",
-    "camembert",
-    "xlmroberta",
-    "longformer",
-    "mpnet",
-]
-
-MODELS_WITH_ADD_PREFIX_SPACE = [
-    "roberta",
-    "camembert",
-    "xlmroberta",
-    "longformer",
-    "mpnet",
-]
-
-MODELS_WITHOUT_SLIDING_WINDOW_SUPPORT = ["squeezebert"]
-
-
-class STSTransformerModel:
+class MonoTransQuestModel:
     def __init__(
-        self,
-        model_type,
-        model_name,
-        tokenizer_type=None,
-        tokenizer_name=None,
-        num_labels=None,
-        weight=None,
-        args=None,
-        use_cuda=True,
-        cuda_device=-1,
-        onnx_execution_provider=None,
-        **kwargs,
+            self,
+            model_type,
+            model_name,
+            num_labels=None,
+            weight=None,
+            args=None,
+            use_cuda=True,
+            cuda_device=-1,
+            onnx_execution_provider=None,
+            **kwargs,
     ):
 
         """
-        Initializes a ClassificationModel model.
+        Initializes a MonoTransQuest model.
 
         Args:
             model_type: The type of model (bert, xlnet, xlm, roberta, distilbert)
             model_name: The exact architecture and trained weights to use. This may be a Hugging Face Transformers compatible pre-trained model, a community model, or the path to a directory containing model files.
-            tokenizer_type: The type of tokenizer (auto, bert, xlnet, xlm, roberta, distilbert, etc.) to use. If a string is passed, Simple Transformers will try to initialize a tokenizer class from the available MODEL_CLASSES.
-                                Alternatively, a Tokenizer class (subclassed from PreTrainedTokenizer) can be passed.
-            tokenizer_name: The name/path to the tokenizer. If the tokenizer_type is not specified, the model_type will be used to determine the type of the tokenizer.
             num_labels (optional): The number of labels or classes in the dataset.
             weight (optional): A list of length num_labels containing the weights to assign to each label for loss calculation.
             args (optional): Default args will be used if this parameter is not provided. If provided, it should be a dict containing the args that should be changed in the default args.
@@ -269,14 +234,6 @@ class STSTransformerModel:
         elif isinstance(args, ClassificationArgs):
             self.args = args
 
-        if (
-            model_type in MODELS_WITHOUT_SLIDING_WINDOW_SUPPORT
-            and self.args.sliding_window
-        ):
-            raise ValueError(
-                "{} does not currently support sliding window".format(model_type)
-            )
-
         if self.args.thread_count:
             torch.set_num_threads(self.args.thread_count)
 
@@ -302,43 +259,22 @@ class STSTransformerModel:
                 try:
                     assert list(self.args.labels_map.keys()) == self.args.labels_list
                 except AssertionError:
-                    assert [
-                        int(key) for key in list(self.args.labels_map.keys())
-                    ] == self.args.labels_list
-                    self.args.labels_map = {
-                        int(key): value for key, value in self.args.labels_map.items()
-                    }
+                    assert [int(key) for key in list(self.args.labels_map.keys())] == self.args.labels_list
+                    self.args.labels_map = {int(key): value for key, value in self.args.labels_map.items()}
             else:
-                self.args.labels_map = {
-                    label: i for i, label in enumerate(self.args.labels_list)
-                }
+                self.args.labels_map = {label: i for i, label in enumerate(self.args.labels_list)}
         else:
             len_labels_list = 2 if not num_labels else num_labels
             self.args.labels_list = [i for i in range(len_labels_list)]
 
         config_class, model_class, tokenizer_class = MODEL_CLASSES[model_type]
-
-        if tokenizer_type is not None:
-            if isinstance(tokenizer_type, str):
-                _, _, tokenizer_class = MODEL_CLASSES[tokenizer_type]
-            else:
-                tokenizer_class = tokenizer_type
-
         if num_labels:
-            self.config = config_class.from_pretrained(
-                model_name, num_labels=num_labels, **self.args.config
-            )
+            self.config = config_class.from_pretrained(model_name, num_labels=num_labels, **self.args.config)
             self.num_labels = num_labels
         else:
             self.config = config_class.from_pretrained(model_name, **self.args.config)
             self.num_labels = self.config.num_labels
-
-        if model_type in MODELS_WITHOUT_CLASS_WEIGHTS_SUPPORT and weight is not None:
-            raise ValueError(
-                "{} does not currently support class weights".format(model_type)
-            )
-        else:
-            self.weight = weight
+        self.weight = weight
 
         if use_cuda:
             if torch.cuda.is_available():
@@ -354,48 +290,43 @@ class STSTransformerModel:
         else:
             self.device = "cpu"
 
-        self.loss_fct = init_loss(
-            weight=self.weight, device=self.device, args=self.args
-        )
-
         if self.args.onnx:
             from onnxruntime import InferenceSession, SessionOptions
 
             if not onnx_execution_provider:
-                onnx_execution_provider = (
-                    "CUDAExecutionProvider" if use_cuda else "CPUExecutionProvider"
-                )
+                onnx_execution_provider = "CUDAExecutionProvider" if use_cuda else "CPUExecutionProvider"
 
             options = SessionOptions()
+            options.intra_op_num_threads = 1
 
             if self.args.dynamic_quantize:
                 model_path = quantize(Path(os.path.join(model_name, "onnx_model.onnx")))
-                self.model = InferenceSession(
-                    model_path.as_posix(), options, providers=[onnx_execution_provider]
-                )
+                self.model = InferenceSession(model_path.as_posix(), options, providers=[onnx_execution_provider])
             else:
                 model_path = os.path.join(model_name, "onnx_model.onnx")
-                self.model = InferenceSession(
-                    model_path, options, providers=[onnx_execution_provider]
-                )
+                self.model = InferenceSession(model_path, options, providers=[onnx_execution_provider])
         else:
             if not self.args.quantized_model:
-                self.model = model_class.from_pretrained(
-                    model_name, config=self.config, **kwargs
-                )
+                if self.weight:
+                    self.model = model_class.from_pretrained(
+                        model_name, config=self.config, weight=torch.Tensor(self.weight).to(self.device), **kwargs,
+                    )
+                else:
+                    self.model = model_class.from_pretrained(model_name, config=self.config, **kwargs)
             else:
-                quantized_weights = torch.load(
-                    os.path.join(model_name, "pytorch_model.bin")
-                )
-
-                self.model = model_class.from_pretrained(
-                    None, config=self.config, state_dict=quantized_weights
-                )
+                quantized_weights = torch.load(os.path.join(model_name, "pytorch_model.bin"))
+                if self.weight:
+                    self.model = model_class.from_pretrained(
+                        None,
+                        config=self.config,
+                        state_dict=quantized_weights,
+                        weight=torch.Tensor(self.weight).to(self.device),
+                    )
+                else:
+                    self.model = model_class.from_pretrained(None, config=self.config, state_dict=quantized_weights)
 
             if self.args.dynamic_quantize:
-                self.model = torch.quantization.quantize_dynamic(
-                    self.model, {torch.nn.Linear}, dtype=torch.qint8
-                )
+                self.model = torch.quantization.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
             if self.args.quantized_model:
                 self.model.load_state_dict(quantized_weights)
             if self.args.dynamic_quantize:
@@ -410,39 +341,27 @@ class STSTransformerModel:
             try:
                 from torch.cuda import amp
             except AttributeError:
-                raise AttributeError(
-                    "fp16 requires Pytorch >= 1.6. Please update Pytorch or turn off fp16."
-                )
+                raise AttributeError("fp16 requires Pytorch >= 1.6. Please update Pytorch or turn off fp16.")
 
-        if tokenizer_name is None:
-            tokenizer_name = model_name
-
-        if tokenizer_name in [
+        if model_name in [
             "vinai/bertweet-base",
             "vinai/bertweet-covid19-base-cased",
             "vinai/bertweet-covid19-base-uncased",
         ]:
             self.tokenizer = tokenizer_class.from_pretrained(
-                tokenizer_name,
-                do_lower_case=self.args.do_lower_case,
-                normalization=True,
-                **kwargs,
+                model_name, do_lower_case=self.args.do_lower_case, normalization=True, **kwargs
             )
         else:
             self.tokenizer = tokenizer_class.from_pretrained(
-                tokenizer_name, do_lower_case=self.args.do_lower_case, **kwargs
+                model_name, do_lower_case=self.args.do_lower_case, **kwargs
             )
 
         if self.args.special_tokens_list:
-            self.tokenizer.add_tokens(
-                self.args.special_tokens_list, special_tokens=True
-            )
+            self.tokenizer.add_tokens(self.args.special_tokens_list, special_tokens=True)
             self.model.resize_token_embeddings(len(self.tokenizer))
 
         self.args.model_name = model_name
         self.args.model_type = model_type
-        self.args.tokenizer_name = tokenizer_name
-        self.args.tokenizer_type = tokenizer_type
 
         if model_type in ["camembert", "xlmroberta"]:
             warnings.warn(
@@ -452,21 +371,19 @@ class STSTransformerModel:
             self.args.use_multiprocessing = False
 
         if self.args.wandb_project and not wandb_available:
-            warnings.warn(
-                "wandb_project specified but wandb is not available. Wandb disabled."
-            )
+            warnings.warn("wandb_project specified but wandb is not available. Wandb disabled.")
             self.args.wandb_project = None
 
     def train_model(
-        self,
-        train_df,
-        multi_label=False,
-        output_dir=None,
-        show_running_loss=True,
-        args=None,
-        eval_df=None,
-        verbose=True,
-        **kwargs,
+            self,
+            train_df,
+            multi_label=False,
+            output_dir=None,
+            show_running_loss=True,
+            args=None,
+            eval_df=None,
+            verbose=True,
+            **kwargs,
     ):
         """
         Trains the model using 'train_df'
@@ -501,46 +418,22 @@ class STSTransformerModel:
         if not output_dir:
             output_dir = self.args.output_dir
 
-        if (
-            os.path.exists(output_dir)
-            and os.listdir(output_dir)
-            and not self.args.overwrite_output_dir
-        ):
+        if os.path.exists(output_dir) and os.listdir(output_dir) and not self.args.overwrite_output_dir:
             raise ValueError(
                 "Output directory ({}) already exists and is not empty."
-                " Set overwrite_output_dir: True to automatically overwrite.".format(
-                    output_dir
-                )
+                " Set overwrite_output_dir: True to automatically overwrite.".format(output_dir)
             )
         self._move_model_to_device()
 
-        if self.args.use_hf_datasets:
-            if self.args.sliding_window:
-                raise ValueError(
-                    "HuggingFace Datasets cannot be used with sliding window."
-                )
-            if self.args.model_type == "layoutlm":
-                raise NotImplementedError(
-                    "HuggingFace Datasets support is not implemented for LayoutLM models"
-                )
-            train_dataset = load_hf_dataset(
-                train_df, self.tokenizer, self.args, multi_label=multi_label
-            )
-        elif isinstance(train_df, str) and self.args.lazy_loading:
+        if isinstance(train_df, str) and self.args.lazy_loading:
             if self.args.sliding_window:
                 raise ValueError("Lazy loading cannot be used with sliding window.")
             if self.args.model_type == "layoutlm":
-                raise NotImplementedError(
-                    "Lazy loading is not implemented for LayoutLM models"
-                )
-            train_dataset = LazyClassificationDataset(
-                train_df, self.tokenizer, self.args
-            )
+                raise NotImplementedError("Lazy loading is not implemented for LayoutLM models")
+            train_dataset = LazyClassificationDataset(train_df, self.tokenizer, self.args)
         else:
             if self.args.lazy_loading:
-                raise ValueError(
-                    "Input must be given as a path to a file when using lazy loading"
-                )
+                raise ValueError("Input must be given as a path to a file when using lazy loading")
             if "text" in train_df.columns and "labels" in train_df.columns:
                 if self.args.model_type == "layoutlm":
                     train_examples = [
@@ -557,30 +450,29 @@ class STSTransformerModel:
                         )
                     ]
                 else:
-                    train_examples = (
-                        train_df["text"].astype(str).tolist(),
-                        train_df["labels"].tolist(),
-                    )
+                    train_examples = [
+                        InputExample(i, text, None, label)
+                        for i, (text, label) in enumerate(zip(train_df["text"].astype(str), train_df["labels"]))
+                    ]
             elif "text_a" in train_df.columns and "text_b" in train_df.columns:
                 if self.args.model_type == "layoutlm":
                     raise ValueError("LayoutLM cannot be used with sentence-pair tasks")
                 else:
-                    train_examples = (
-                        train_df["text_a"].astype(str).tolist(),
-                        train_df["text_b"].astype(str).tolist(),
-                        train_df["labels"].tolist(),
-                    )
+                    train_examples = [
+                        InputExample(i, text_a, text_b, label)
+                        for i, (text_a, text_b, label) in enumerate(
+                            zip(train_df["text_a"].astype(str), train_df["text_b"].astype(str), train_df["labels"])
+                        )
+                    ]
             else:
                 warnings.warn(
                     "Dataframe headers not specified. Falling back to using column 0 as text and column 1 as labels."
                 )
-                train_examples = (
-                    train_df.iloc[:, 0].astype(str).tolist(),
-                    train_df.iloc[:, 1].tolist(),
-                )
-            train_dataset = self.load_and_cache_examples(
-                train_examples, verbose=verbose
-            )
+                train_examples = [
+                    InputExample(i, text, None, label)
+                    for i, (text, label) in enumerate(zip(train_df.iloc[:, 0], train_df.iloc[:, 1]))
+                ]
+            train_dataset = self.load_and_cache_examples(train_examples, verbose=verbose)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(
             train_dataset,
@@ -608,24 +500,19 @@ class STSTransformerModel:
         self.save_model(model=self.model)
 
         if verbose:
-            logger.info(
-                " Training of {} model complete. Saved to {}.".format(
-                    self.args.model_type, output_dir
-                )
-            )
+            logger.info(" Training of {} model complete. Saved to {}.".format(self.args.model_type, output_dir))
 
         return global_step, training_details
 
     def train(
-        self,
-        train_dataloader,
-        output_dir,
-        multi_label=False,
-        show_running_loss=True,
-        eval_df=None,
-        test_df=None,
-        verbose=True,
-        **kwargs,
+            self,
+            train_dataloader,
+            output_dir,
+            multi_label=False,
+            show_running_loss=True,
+            eval_df=None,
+            verbose=True,
+            **kwargs,
     ):
         """
         Trains the model on train_dataset.
@@ -636,13 +523,9 @@ class STSTransformerModel:
         model = self.model
         args = self.args
 
-        tb_writer = SummaryWriter(log_dir=args.tensorboard_dir)
+        tb_writer = SummaryWriter(logdir=args.tensorboard_dir)
 
-        t_total = (
-            len(train_dataloader)
-            // args.gradient_accumulation_steps
-            * args.num_train_epochs
-        )
+        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
         no_decay = ["bias", "LayerNorm.weight"]
 
@@ -652,9 +535,7 @@ class STSTransformerModel:
             params = group.pop("params")
             custom_parameter_names.update(params)
             param_group = {**group}
-            param_group["params"] = [
-                p for n, p in model.named_parameters() if n in params
-            ]
+            param_group["params"] = [p for n, p in model.named_parameters() if n in params]
             optimizer_grouped_parameters.append(param_group)
 
         for group in self.args.custom_layer_parameters:
@@ -685,8 +566,7 @@ class STSTransformerModel:
                         "params": [
                             p
                             for n, p in model.named_parameters()
-                            if n not in custom_parameter_names
-                            and not any(nd in n for nd in no_decay)
+                            if n not in custom_parameter_names and not any(nd in n for nd in no_decay)
                         ],
                         "weight_decay": args.weight_decay,
                     },
@@ -694,8 +574,7 @@ class STSTransformerModel:
                         "params": [
                             p
                             for n, p in model.named_parameters()
-                            if n not in custom_parameter_names
-                            and any(nd in n for nd in no_decay)
+                            if n not in custom_parameter_names and any(nd in n for nd in no_decay)
                         ],
                         "weight_decay": 0.0,
                     },
@@ -703,16 +582,10 @@ class STSTransformerModel:
             )
 
         warmup_steps = math.ceil(t_total * args.warmup_ratio)
-        args.warmup_steps = (
-            warmup_steps if args.warmup_steps == 0 else args.warmup_steps
-        )
+        args.warmup_steps = warmup_steps if args.warmup_steps == 0 else args.warmup_steps
 
         if args.optimizer == "AdamW":
-            optimizer = AdamW(
-                optimizer_grouped_parameters,
-                lr=args.learning_rate,
-                eps=args.adam_epsilon,
-            )
+            optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
         elif args.optimizer == "Adafactor":
             optimizer = Adafactor(
                 optimizer_grouped_parameters,
@@ -738,15 +611,11 @@ class STSTransformerModel:
             scheduler = get_constant_schedule(optimizer)
 
         elif args.scheduler == "constant_schedule_with_warmup":
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=args.warmup_steps
-            )
+            scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps)
 
         elif args.scheduler == "linear_schedule_with_warmup":
             scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=args.warmup_steps,
-                num_training_steps=t_total,
+                optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
             )
 
         elif args.scheduler == "cosine_schedule_with_warmup":
@@ -771,7 +640,7 @@ class STSTransformerModel:
                 num_warmup_steps=args.warmup_steps,
                 num_training_steps=t_total,
                 lr_end=args.polynomial_decay_schedule_lr_end,
-                power=args.polynomial_decay_schedule_power,
+                power=args.polynomial_decay_schedule_lr_end,
             )
 
         else:
@@ -784,9 +653,7 @@ class STSTransformerModel:
         training_progress_scores = None
         tr_loss, logging_loss = 0.0, 0.0
         model.zero_grad()
-        train_iterator = trange(
-            int(args.num_train_epochs), desc="Epoch", disable=args.silent, mininterval=0
-        )
+        train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.silent, mininterval=0)
         epoch_number = 0
         best_eval_metric = None
         early_stopping_counter = 0
@@ -803,40 +670,25 @@ class STSTransformerModel:
                 else:
                     checkpoint_suffix = checkpoint_suffix[-1]
                 global_step = int(checkpoint_suffix)
-                epochs_trained = global_step // (
-                    len(train_dataloader) // args.gradient_accumulation_steps
-                )
+                epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
                 steps_trained_in_current_epoch = global_step % (
-                    len(train_dataloader) // args.gradient_accumulation_steps
+                        len(train_dataloader) // args.gradient_accumulation_steps
                 )
 
-                logger.info(
-                    "   Continuing training from checkpoint, will skip to saved global_step"
-                )
+                logger.info("   Continuing training from checkpoint, will skip to saved global_step")
                 logger.info("   Continuing training from epoch %d", epochs_trained)
                 logger.info("   Continuing training from global step %d", global_step)
-                logger.info(
-                    "   Will skip the first %d steps in the current epoch",
-                    steps_trained_in_current_epoch,
-                )
+                logger.info("   Will skip the first %d steps in the current epoch", steps_trained_in_current_epoch)
             except ValueError:
                 logger.info("   Starting fine-tuning.")
 
         if args.evaluate_during_training:
-            training_progress_scores = self._create_training_progress_scores(
-                multi_label, **kwargs
-            )
+            training_progress_scores = self._create_training_progress_scores(multi_label, **kwargs)
 
         if args.wandb_project:
             if not wandb.setup().settings.sweep_id:
                 logger.info(" Initializing WandB run for training.")
-                wandb.init(
-                    project=args.wandb_project,
-                    config={**asdict(args)},
-                    **args.wandb_kwargs,
-                )
-                wandb.run._label(repo="simpletransformers")
-                self.wandb_run_id = wandb.run.id
+                wandb.init(project=args.wandb_project, config={**asdict(args)}, **args.wandb_kwargs)
             wandb.watch(self.model)
 
         if self.args.fp16:
@@ -849,9 +701,7 @@ class STSTransformerModel:
             if epochs_trained > 0:
                 epochs_trained -= 1
                 continue
-            train_iterator.set_description(
-                f"Epoch {epoch_number + 1} of {args.num_train_epochs}"
-            )
+            train_iterator.set_description(f"Epoch {epoch_number + 1} of {args.num_train_epochs}")
             batch_iterator = tqdm(
                 train_dataloader,
                 desc=f"Running Epoch {epoch_number} of {args.num_train_epochs}",
@@ -866,26 +716,16 @@ class STSTransformerModel:
                 inputs = self._get_inputs_dict(batch)
                 if self.args.fp16:
                     with amp.autocast():
-                        loss, *_ = self._calculate_loss(
-                            model,
-                            inputs,
-                            loss_fct=self.loss_fct,
-                            num_labels=self.num_labels,
-                            args=self.args,
-                        )
+                        outputs = model(**inputs)
+                        # model outputs are always tuple in pytorch-transformers (see doc)
+                        loss = outputs[0]
                 else:
-                    loss, *_ = self._calculate_loss(
-                        model,
-                        inputs,
-                        loss_fct=self.loss_fct,
-                        num_labels=self.num_labels,
-                        args=self.args,
-                    )
+                    outputs = model(**inputs)
+                    # model outputs are always tuple in pytorch-transformers (see doc)
+                    loss = outputs[0]
 
                 if args.n_gpu > 1:
-                    loss = (
-                        loss.mean()
-                    )  # mean() to average on multi-gpu parallel training
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
                 current_loss = loss.item()
 
@@ -907,9 +747,7 @@ class STSTransformerModel:
                     if self.args.fp16:
                         scaler.unscale_(optimizer)
                     if args.optimizer == "AdamW":
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), args.max_grad_norm
-                        )
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     if self.args.fp16:
                         scaler.step(optimizer)
@@ -922,14 +760,8 @@ class STSTransformerModel:
 
                     if args.logging_steps > 0 and global_step % args.logging_steps == 0:
                         # Log metrics
-                        tb_writer.add_scalar(
-                            "lr", scheduler.get_last_lr()[0], global_step
-                        )
-                        tb_writer.add_scalar(
-                            "loss",
-                            (tr_loss - logging_loss) / args.logging_steps,
-                            global_step,
-                        )
+                        tb_writer.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
+                        tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
                         logging_loss = tr_loss
                         if args.wandb_project or self.is_sweeping:
                             wandb.log(
@@ -942,17 +774,17 @@ class STSTransformerModel:
 
                     if args.save_steps > 0 and global_step % args.save_steps == 0:
                         # Save model checkpoint
-                        output_dir_current = os.path.join(
-                            output_dir, "checkpoint-{}".format(global_step)
-                        )
+                        if args.save_recent_only:
+                            del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                            for del_path in del_paths:
+                                shutil.rmtree(del_path)
+                        output_dir_current = os.path.join(output_dir, "checkpoint-{}".format(global_step))
 
-                        self.save_model(
-                            output_dir_current, optimizer, scheduler, model=model
-                        )
+                        self.save_model(output_dir_current, optimizer, scheduler, model=model)
 
                     if args.evaluate_during_training and (
-                        args.evaluate_during_training_steps > 0
-                        and global_step % args.evaluate_during_training_steps == 0
+                            args.evaluate_during_training_steps > 0
+                            and global_step % args.evaluate_during_training_steps == 0
                     ):
                         # Only evaluate when single GPU otherwise metrics may not average well
                         results, _, _ = self.eval_model(
@@ -962,96 +794,51 @@ class STSTransformerModel:
                             wandb_log=False,
                             **kwargs,
                         )
+                        for key, value in results.items():
+                            tb_writer.add_scalar("eval_{}".format(key), value, global_step)
 
-                        output_dir_current = os.path.join(
-                            output_dir, "checkpoint-{}".format(global_step)
-                        )
+                        output_dir_current = os.path.join(output_dir, "checkpoint-{}".format(global_step))
 
                         if args.save_eval_checkpoints:
-                            self.save_model(
-                                output_dir_current,
-                                optimizer,
-                                scheduler,
-                                model=model,
-                                results=results,
-                            )
+                            if args.save_recent_only:
+                                del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                                for del_path in del_paths:
+                                    shutil.rmtree(del_path)
+                            self.save_model(output_dir_current, optimizer, scheduler, model=model, results=results)
 
                         training_progress_scores["global_step"].append(global_step)
                         training_progress_scores["train_loss"].append(current_loss)
                         for key in results:
                             training_progress_scores[key].append(results[key])
-
-                        if test_df is not None:
-                            test_results, _, _ = self.eval_model(
-                                test_df,
-                                verbose=verbose
-                                and args.evaluate_during_training_verbose,
-                                silent=args.evaluate_during_training_silent,
-                                wandb_log=False,
-                                **kwargs,
-                            )
-                            for key in test_results:
-                                training_progress_scores["test_" + key].append(
-                                    test_results[key]
-                                )
-
                         report = pd.DataFrame(training_progress_scores)
                         report.to_csv(
-                            os.path.join(
-                                args.output_dir, "training_progress_scores.csv"
-                            ),
-                            index=False,
+                            os.path.join(args.output_dir, "training_progress_scores.csv"), index=False,
                         )
 
                         if args.wandb_project or self.is_sweeping:
                             wandb.log(self._get_last_metrics(training_progress_scores))
 
-
                         if not best_eval_metric:
                             best_eval_metric = results[args.early_stopping_metric]
-                            self.save_model(
-                                args.best_model_dir,
-                                optimizer,
-                                scheduler,
-                                model=model,
-                                results=results,
-                            )
+                            self.save_model(args.best_model_dir, optimizer, scheduler, model=model, results=results)
                         if best_eval_metric and args.early_stopping_metric_minimize:
-                            if (
-                                best_eval_metric - results[args.early_stopping_metric]
-                                > args.early_stopping_delta
-                            ):
+                            if best_eval_metric - results[args.early_stopping_metric] > args.early_stopping_delta:
                                 best_eval_metric = results[args.early_stopping_metric]
                                 self.save_model(
-                                    args.best_model_dir,
-                                    optimizer,
-                                    scheduler,
-                                    model=model,
-                                    results=results,
+                                    args.best_model_dir, optimizer, scheduler, model=model, results=results
                                 )
                                 early_stopping_counter = 0
                             else:
                                 if args.use_early_stopping:
-                                    if (
-                                        early_stopping_counter
-                                        < args.early_stopping_patience
-                                    ):
+                                    if early_stopping_counter < args.early_stopping_patience:
                                         early_stopping_counter += 1
                                         if verbose:
-                                            logger.info(
-                                                f" No improvement in {args.early_stopping_metric}"
-                                            )
-                                            logger.info(
-                                                f" Current step: {early_stopping_counter}"
-                                            )
-                                            logger.info(
-                                                f" Early stopping patience: {args.early_stopping_patience}"
-                                            )
+                                            logger.info(f" No improvement in {args.early_stopping_metric}")
+                                            logger.info(f" Current step: {early_stopping_counter}")
+                                            logger.info(f" Early stopping patience: {args.early_stopping_patience}")
                                     else:
                                         if verbose:
-                                            logger.info(
-                                                f" Patience of {args.early_stopping_patience} steps reached"
-                                            )
+                                            logger.info(f" Patience of {args.early_stopping_patience} steps reached")
                                             logger.info(" Training terminated.")
                                             train_iterator.close()
                                         return (
@@ -1061,41 +848,23 @@ class STSTransformerModel:
                                             else training_progress_scores,
                                         )
                         else:
-                            if (
-                                results[args.early_stopping_metric] - best_eval_metric
-                                > args.early_stopping_delta
-                            ):
+                            if results[args.early_stopping_metric] - best_eval_metric > args.early_stopping_delta:
                                 best_eval_metric = results[args.early_stopping_metric]
                                 self.save_model(
-                                    args.best_model_dir,
-                                    optimizer,
-                                    scheduler,
-                                    model=model,
-                                    results=results,
+                                    args.best_model_dir, optimizer, scheduler, model=model, results=results
                                 )
                                 early_stopping_counter = 0
                             else:
                                 if args.use_early_stopping:
-                                    if (
-                                        early_stopping_counter
-                                        < args.early_stopping_patience
-                                    ):
+                                    if early_stopping_counter < args.early_stopping_patience:
                                         early_stopping_counter += 1
                                         if verbose:
-                                            logger.info(
-                                                f" No improvement in {args.early_stopping_metric}"
-                                            )
-                                            logger.info(
-                                                f" Current step: {early_stopping_counter}"
-                                            )
-                                            logger.info(
-                                                f" Early stopping patience: {args.early_stopping_patience}"
-                                            )
+                                            logger.info(f" No improvement in {args.early_stopping_metric}")
+                                            logger.info(f" Current step: {early_stopping_counter}")
+                                            logger.info(f" Early stopping patience: {args.early_stopping_patience}")
                                     else:
                                         if verbose:
-                                            logger.info(
-                                                f" Patience of {args.early_stopping_patience} steps reached"
-                                            )
+                                            logger.info(f" Patience of {args.early_stopping_patience} steps reached")
                                             logger.info(" Training terminated.")
                                             train_iterator.close()
                                         return (
@@ -1104,14 +873,15 @@ class STSTransformerModel:
                                             if not self.args.evaluate_during_training
                                             else training_progress_scores,
                                         )
-                        model.train()
 
             epoch_number += 1
-            output_dir_current = os.path.join(
-                output_dir, "checkpoint-{}-epoch-{}".format(global_step, epoch_number)
-            )
+            output_dir_current = os.path.join(output_dir, "checkpoint-{}-epoch-{}".format(global_step, epoch_number))
 
             if args.save_model_every_epoch or args.evaluate_during_training:
+                if args.save_recent_only:
+                    del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                    for del_path in del_paths:
+                        shutil.rmtree(del_path)
                 os.makedirs(output_dir_current, exist_ok=True)
 
             if args.save_model_every_epoch:
@@ -1126,93 +896,37 @@ class STSTransformerModel:
                     **kwargs,
                 )
 
-                self.save_model(
-                    output_dir_current, optimizer, scheduler, results=results
-                )
+                self.save_model(output_dir_current, optimizer, scheduler, results=results)
 
                 training_progress_scores["global_step"].append(global_step)
                 training_progress_scores["train_loss"].append(current_loss)
                 for key in results:
                     training_progress_scores[key].append(results[key])
-                if test_df is not None:
-                    test_results, _, _ = self.eval_model(
-                        test_df,
-                        verbose=verbose and args.evaluate_during_training_verbose,
-                        silent=args.evaluate_during_training_silent,
-                        wandb_log=False,
-                        **kwargs,
-                    )
-                    for key in test_results:
-                        training_progress_scores["test_" + key].append(
-                            test_results[key]
-                        )
-
                 report = pd.DataFrame(training_progress_scores)
-                report.to_csv(
-                    os.path.join(args.output_dir, "training_progress_scores.csv"),
-                    index=False,
-                )
+                report.to_csv(os.path.join(args.output_dir, "training_progress_scores.csv"), index=False)
 
                 if args.wandb_project or self.is_sweeping:
                     wandb.log(self._get_last_metrics(training_progress_scores))
 
-                for key, value in flatten_results(
-                    self._get_last_metrics(training_progress_scores)
-                ):
-                    try:
-                        tb_writer.add_scalar(key, value, global_step)
-                    except (NotImplementedError, AssertionError):
-                        if verbose:
-                            logger.warning(
-                                f"can't log value of type: {type(value)} to tensorboar"
-                            )
-                tb_writer.flush()
-
                 if not best_eval_metric:
                     best_eval_metric = results[args.early_stopping_metric]
-                    self.save_model(
-                        args.best_model_dir,
-                        optimizer,
-                        scheduler,
-                        model=model,
-                        results=results,
-                    )
+                    self.save_model(args.best_model_dir, optimizer, scheduler, model=model, results=results)
                 if best_eval_metric and args.early_stopping_metric_minimize:
-                    if (
-                        best_eval_metric - results[args.early_stopping_metric]
-                        > args.early_stopping_delta
-                    ):
+                    if best_eval_metric - results[args.early_stopping_metric] > args.early_stopping_delta:
                         best_eval_metric = results[args.early_stopping_metric]
-                        self.save_model(
-                            args.best_model_dir,
-                            optimizer,
-                            scheduler,
-                            model=model,
-                            results=results,
-                        )
+                        self.save_model(args.best_model_dir, optimizer, scheduler, model=model, results=results)
                         early_stopping_counter = 0
                     else:
-                        if (
-                            args.use_early_stopping
-                            and args.early_stopping_consider_epochs
-                        ):
+                        if args.use_early_stopping and args.early_stopping_consider_epochs:
                             if early_stopping_counter < args.early_stopping_patience:
                                 early_stopping_counter += 1
                                 if verbose:
-                                    logger.info(
-                                        f" No improvement in {args.early_stopping_metric}"
-                                    )
-                                    logger.info(
-                                        f" Current step: {early_stopping_counter}"
-                                    )
-                                    logger.info(
-                                        f" Early stopping patience: {args.early_stopping_patience}"
-                                    )
+                                    logger.info(f" No improvement in {args.early_stopping_metric}")
+                                    logger.info(f" Current step: {early_stopping_counter}")
+                                    logger.info(f" Early stopping patience: {args.early_stopping_patience}")
                             else:
                                 if verbose:
-                                    logger.info(
-                                        f" Patience of {args.early_stopping_patience} steps reached"
-                                    )
+                                    logger.info(f" Patience of {args.early_stopping_patience} steps reached")
                                     logger.info(" Training terminated.")
                                     train_iterator.close()
                                 return (
@@ -1222,41 +936,21 @@ class STSTransformerModel:
                                     else training_progress_scores,
                                 )
                 else:
-                    if (
-                        results[args.early_stopping_metric] - best_eval_metric
-                        > args.early_stopping_delta
-                    ):
+                    if results[args.early_stopping_metric] - best_eval_metric > args.early_stopping_delta:
                         best_eval_metric = results[args.early_stopping_metric]
-                        self.save_model(
-                            args.best_model_dir,
-                            optimizer,
-                            scheduler,
-                            model=model,
-                            results=results,
-                        )
+                        self.save_model(args.best_model_dir, optimizer, scheduler, model=model, results=results)
                         early_stopping_counter = 0
                     else:
-                        if (
-                            args.use_early_stopping
-                            and args.early_stopping_consider_epochs
-                        ):
+                        if args.use_early_stopping and args.early_stopping_consider_epochs:
                             if early_stopping_counter < args.early_stopping_patience:
                                 early_stopping_counter += 1
                                 if verbose:
-                                    logger.info(
-                                        f" No improvement in {args.early_stopping_metric}"
-                                    )
-                                    logger.info(
-                                        f" Current step: {early_stopping_counter}"
-                                    )
-                                    logger.info(
-                                        f" Early stopping patience: {args.early_stopping_patience}"
-                                    )
+                                    logger.info(f" No improvement in {args.early_stopping_metric}")
+                                    logger.info(f" Current step: {early_stopping_counter}")
+                                    logger.info(f" Early stopping patience: {args.early_stopping_patience}")
                             else:
                                 if verbose:
-                                    logger.info(
-                                        f" Patience of {args.early_stopping_patience} steps reached"
-                                    )
+                                    logger.info(f" Patience of {args.early_stopping_patience} steps reached")
                                     logger.info(" Training terminated.")
                                     train_iterator.close()
                                 return (
@@ -1268,20 +962,11 @@ class STSTransformerModel:
 
         return (
             global_step,
-            tr_loss / global_step
-            if not self.args.evaluate_during_training
-            else training_progress_scores,
+            tr_loss / global_step if not self.args.evaluate_during_training else training_progress_scores,
         )
 
     def eval_model(
-        self,
-        eval_df,
-        multi_label=False,
-        output_dir=None,
-        verbose=True,
-        silent=False,
-        wandb_log=True,
-        **kwargs,
+            self, eval_df, multi_label=False, output_dir=None, verbose=True, silent=False, wandb_log=True, **kwargs
     ):
         """
         Evaluates the model on eval_df. Saves results to output_dir.
@@ -1308,13 +993,7 @@ class STSTransformerModel:
         self._move_model_to_device()
 
         result, model_outputs, wrong_preds = self.evaluate(
-            eval_df,
-            output_dir,
-            multi_label=multi_label,
-            verbose=verbose,
-            silent=silent,
-            wandb_log=wandb_log,
-            **kwargs,
+            eval_df, output_dir, multi_label=multi_label, verbose=verbose, silent=silent, wandb_log=wandb_log, **kwargs
         )
         self.results.update(result)
 
@@ -1324,15 +1003,8 @@ class STSTransformerModel:
         return result, model_outputs, wrong_preds
 
     def evaluate(
-        self,
-        eval_df,
-        output_dir,
-        multi_label=False,
-        prefix="",
-        verbose=True,
-        silent=False,
-        wandb_log=True,
-        **kwargs,
+            self, eval_df, output_dir, multi_label=False, prefix="", verbose=True, silent=False, wandb_log=True,
+            **kwargs
     ):
         """
         Evaluates the model on eval_df.
@@ -1345,31 +1017,14 @@ class STSTransformerModel:
         eval_output_dir = output_dir
 
         results = {}
-        if self.args.use_hf_datasets:
-            if self.args.sliding_window:
-                raise ValueError(
-                    "HuggingFace Datasets cannot be used with sliding window."
-                )
+        if isinstance(eval_df, str) and self.args.lazy_loading:
             if self.args.model_type == "layoutlm":
-                raise NotImplementedError(
-                    "HuggingFace Datasets support is not implemented for LayoutLM models"
-                )
-            eval_dataset = load_hf_dataset(
-                eval_df, self.tokenizer, self.args, multi_label=multi_label
-            )
-            eval_examples = None
-        elif isinstance(eval_df, str) and self.args.lazy_loading:
-            if self.args.model_type == "layoutlm":
-                raise NotImplementedError(
-                    "Lazy loading is not implemented for LayoutLM models"
-                )
+                raise NotImplementedError("Lazy loading is not implemented for LayoutLM models")
             eval_dataset = LazyClassificationDataset(eval_df, self.tokenizer, self.args)
             eval_examples = None
         else:
             if self.args.lazy_loading:
-                raise ValueError(
-                    "Input must be given as a path to a file when using lazy loading"
-                )
+                raise ValueError("Input must be given as a path to a file when using lazy loading")
 
             if "text" in eval_df.columns and "labels" in eval_df.columns:
                 if self.args.model_type == "layoutlm":
@@ -1387,27 +1042,28 @@ class STSTransformerModel:
                         )
                     ]
                 else:
-                    eval_examples = (
-                        eval_df["text"].astype(str).tolist(),
-                        eval_df["labels"].tolist(),
-                    )
+                    eval_examples = [
+                        InputExample(i, text, None, label)
+                        for i, (text, label) in enumerate(zip(eval_df["text"].astype(str), eval_df["labels"]))
+                    ]
             elif "text_a" in eval_df.columns and "text_b" in eval_df.columns:
                 if self.args.model_type == "layoutlm":
                     raise ValueError("LayoutLM cannot be used with sentence-pair tasks")
                 else:
-                    eval_examples = (
-                        eval_df["text_a"].astype(str).tolist(),
-                        eval_df["text_b"].astype(str).tolist(),
-                        eval_df["labels"].tolist(),
-                    )
+                    eval_examples = [
+                        InputExample(i, text_a, text_b, label)
+                        for i, (text_a, text_b, label) in enumerate(
+                            zip(eval_df["text_a"].astype(str), eval_df["text_b"].astype(str), eval_df["labels"])
+                        )
+                    ]
             else:
                 warnings.warn(
                     "Dataframe headers not specified. Falling back to using column 0 as text and column 1 as labels."
                 )
-                eval_examples = (
-                    eval_df.iloc[:, 0].astype(str).tolist(),
-                    eval_df.iloc[:, 1].tolist(),
-                )
+                eval_examples = [
+                    InputExample(i, text, None, label)
+                    for i, (text, label) in enumerate(zip(eval_df.iloc[:, 0], eval_df.iloc[:, 1]))
+                ]
 
             if args.sliding_window:
                 eval_dataset, window_counts = self.load_and_cache_examples(
@@ -1420,9 +1076,7 @@ class STSTransformerModel:
         os.makedirs(eval_output_dir, exist_ok=True)
 
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(
-            eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
-        )
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         if args.n_gpu > 1:
             model = torch.nn.DataParallel(model)
@@ -1440,13 +1094,7 @@ class STSTransformerModel:
         if self.args.fp16:
             from torch.cuda import amp
 
-        for i, batch in enumerate(
-            tqdm(
-                eval_dataloader,
-                disable=args.silent or silent,
-                desc="Running Evaluation",
-            )
-        ):
+        for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent or silent, desc="Running Evaluation")):
             # batch = tuple(t.to(device) for t in batch)
 
             with torch.no_grad():
@@ -1454,22 +1102,10 @@ class STSTransformerModel:
 
                 if self.args.fp16:
                     with amp.autocast():
-                        outputs = self._calculate_loss(
-                            model,
-                            inputs,
-                            loss_fct=self.loss_fct,
-                            num_labels=self.num_labels,
-                            args=self.args,
-                        )
+                        outputs = model(**inputs)
                         tmp_eval_loss, logits = outputs[:2]
                 else:
-                    outputs = self._calculate_loss(
-                        model,
-                        inputs,
-                        loss_fct=self.loss_fct,
-                        num_labels=self.num_labels,
-                        args=self.args,
-                    )
+                    outputs = model(**inputs)
                     tmp_eval_loss, logits = outputs[:2]
 
                 if multi_label:
@@ -1481,15 +1117,9 @@ class STSTransformerModel:
             nb_eval_steps += 1
 
             start_index = self.args.eval_batch_size * i
-            end_index = (
-                start_index + self.args.eval_batch_size
-                if i != (n_batches - 1)
-                else len(eval_dataset)
-            )
+            end_index = start_index + self.args.eval_batch_size if i != (n_batches - 1) else len(eval_dataset)
             preds[start_index:end_index] = logits.detach().cpu().numpy()
-            out_label_ids[start_index:end_index] = (
-                inputs["labels"].detach().cpu().numpy()
-            )
+            out_label_ids[start_index:end_index] = inputs["labels"].detach().cpu().numpy()
 
             # if preds is None:
             #     preds = logits.detach().cpu().numpy()
@@ -1507,14 +1137,9 @@ class STSTransformerModel:
                 window_ranges.append([count, count + n_windows])
                 count += n_windows
 
-            preds = [
-                preds[window_range[0] : window_range[1]]
-                for window_range in window_ranges
-            ]
+            preds = [preds[window_range[0]: window_range[1]] for window_range in window_ranges]
             out_label_ids = [
-                out_label_ids[i]
-                for i in range(len(out_label_ids))
-                if i in [window[0] for window in window_ranges]
+                out_label_ids[i] for i in range(len(out_label_ids)) if i in [window[0] for window in window_ranges]
             ]
 
             model_outputs = preds
@@ -1522,14 +1147,11 @@ class STSTransformerModel:
             preds = [np.argmax(pred, axis=1) for pred in preds]
             final_preds = []
             for pred_row in preds:
-                val_freqs_desc = Counter(pred_row).most_common()
-                if (
-                    len(val_freqs_desc) > 1
-                    and val_freqs_desc[0][1] == val_freqs_desc[1][1]
-                ):
+                mode_pred, counts = mode(pred_row)
+                if len(counts) > 1 and counts[0] == counts[1]:
                     final_preds.append(args.tie_value)
                 else:
-                    final_preds.append(val_freqs_desc[0][0])
+                    final_preds.append(mode_pred[0])
             preds = np.array(final_preds)
         elif not multi_label and args.regression is True:
             preds = np.squeeze(preds)
@@ -1540,9 +1162,7 @@ class STSTransformerModel:
             if not multi_label:
                 preds = np.argmax(preds, axis=1)
 
-        result, wrong = self.compute_metrics(
-            preds, model_outputs, out_label_ids, eval_examples, **kwargs
-        )
+        result, wrong = self.compute_metrics(preds, out_label_ids, eval_examples, **kwargs)
         result["eval_loss"] = eval_loss
         results.update(result)
 
@@ -1551,35 +1171,21 @@ class STSTransformerModel:
             for key in sorted(result.keys()):
                 writer.write("{} = {}\n".format(key, str(result[key])))
 
-        if (
-            self.args.wandb_project
-            and wandb_log
-            and not multi_label
-            and not self.args.regression
-        ):
+        if self.args.wandb_project and wandb_log and not multi_label and not self.args.regression:
             if not wandb.setup().settings.sweep_id:
                 logger.info(" Initializing WandB run for evaluation.")
-                wandb.init(
-                    project=args.wandb_project,
-                    config={**asdict(args)},
-                    **args.wandb_kwargs,
-                )
-                wandb.run._label(repo="simpletransformers")
+                wandb.init(project=args.wandb_project, config={**asdict(args)}, **args.wandb_kwargs)
             if not args.labels_map:
                 self.args.labels_map = {i: i for i in range(self.num_labels)}
 
             labels_list = sorted(list(self.args.labels_map.keys()))
-            inverse_labels_map = {
-                value: key for key, value in self.args.labels_map.items()
-            }
+            inverse_labels_map = {value: key for key, value in self.args.labels_map.items()}
 
             truth = [inverse_labels_map[out] for out in out_label_ids]
 
             # Confusion Matrix
             wandb.sklearn.plot_confusion_matrix(
-                truth,
-                [inverse_labels_map[pred] for pred in preds],
-                labels=labels_list,
+                truth, [inverse_labels_map[pred] for pred in preds], labels=labels_list,
             )
 
             if not self.args.sliding_window:
@@ -1587,24 +1193,12 @@ class STSTransformerModel:
                 wandb.log({"roc": wandb.plots.ROC(truth, model_outputs, labels_list)})
 
                 # Precision Recall
-                wandb.log(
-                    {
-                        "pr": wandb.plots.precision_recall(
-                            truth, model_outputs, labels_list
-                        )
-                    }
-                )
+                wandb.log({"pr": wandb.plots.precision_recall(truth, model_outputs, labels_list)})
 
         return results, model_outputs, wrong
 
     def load_and_cache_examples(
-        self,
-        examples,
-        evaluate=False,
-        no_cache=False,
-        multi_label=False,
-        verbose=True,
-        silent=False,
+            self, examples, evaluate=False, no_cache=False, multi_label=False, verbose=True, silent=False
     ):
         """
         Converts a list of InputExample objects to a TensorDataset containing InputFeatures. Caches the InputFeatures.
@@ -1629,179 +1223,111 @@ class STSTransformerModel:
             os.makedirs(self.args.cache_dir, exist_ok=True)
 
         mode = "dev" if evaluate else "train"
-        if args.sliding_window or self.args.model_type == "layoutlm":
-            cached_features_file = os.path.join(
-                args.cache_dir,
-                "cached_{}_{}_{}_{}_{}".format(
-                    mode,
-                    args.model_type,
-                    args.max_seq_length,
-                    self.num_labels,
-                    len(examples),
-                ),
-            )
+        cached_features_file = os.path.join(
+            args.cache_dir,
+            "cached_{}_{}_{}_{}_{}".format(
+                mode, args.model_type, args.max_seq_length, self.num_labels, len(examples),
+            ),
+        )
 
-            if os.path.exists(cached_features_file) and (
+        if os.path.exists(cached_features_file) and (
                 (not args.reprocess_input_data and not no_cache)
                 or (mode == "dev" and args.use_cached_eval_features and not no_cache)
-            ):
-                features = torch.load(cached_features_file)
-                if verbose:
-                    logger.info(
-                        f" Features loaded from cache at {cached_features_file}"
-                    )
-            else:
-                if verbose:
-                    logger.info(" Converting to features started. Cache is not used.")
-                    if args.sliding_window:
-                        logger.info(" Sliding window enabled")
-
-                if self.args.model_type != "layoutlm":
-                    if len(examples) == 3:
-                        examples = [
-                            InputExample(i, text_a, text_b, label)
-                            for i, (text_a, text_b, label) in enumerate(zip(*examples))
-                        ]
-                    else:
-                        examples = [
-                            InputExample(i, text_a, None, label)
-                            for i, (text_a, label) in enumerate(zip(*examples))
-                        ]
-
-                # If labels_map is defined, then labels need to be replaced with ints
-                if self.args.labels_map and not self.args.regression:
-                    for example in examples:
-                        if multi_label:
-                            example.label = [
-                                self.args.labels_map[label] for label in example.label
-                            ]
-                        else:
-                            example.label = self.args.labels_map[example.label]
-
-                features = convert_examples_to_features(
-                    examples,
-                    args.max_seq_length,
-                    tokenizer,
-                    output_mode,
-                    # XLNet has a CLS token at the end
-                    cls_token_at_end=bool(args.model_type in ["xlnet"]),
-                    cls_token=tokenizer.cls_token,
-                    cls_token_segment_id=2 if args.model_type in ["xlnet"] else 0,
-                    sep_token=tokenizer.sep_token,
-                    # RoBERTa uses an extra separator b/w pairs of sentences,
-                    # cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
-                    sep_token_extra=args.model_type in MODELS_WITH_EXTRA_SEP_TOKEN,
-                    # PAD on the left for XLNet
-                    pad_on_left=bool(args.model_type in ["xlnet"]),
-                    pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
-                    pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,
-                    process_count=process_count,
-                    multi_label=multi_label,
-                    silent=args.silent or silent,
-                    use_multiprocessing=args.use_multiprocessing_for_evaluation,
-                    sliding_window=args.sliding_window,
-                    flatten=not evaluate,
-                    stride=args.stride,
-                    add_prefix_space=args.model_type in MODELS_WITH_ADD_PREFIX_SPACE,
-                    # avoid padding in case of single example/online inferencing to decrease execution time
-                    pad_to_max_length=bool(len(examples) > 1),
-                    args=args,
-                )
-                if verbose and args.sliding_window:
-                    logger.info(
-                        f" {len(features)} features created from {len(examples)} samples."
-                    )
-
-                if not no_cache:
-                    torch.save(features, cached_features_file)
-
-            if args.sliding_window and evaluate:
-                features = [
-                    [feature_set] if not isinstance(feature_set, list) else feature_set
-                    for feature_set in features
-                ]
-                window_counts = [len(sample) for sample in features]
-                features = [
-                    feature for feature_set in features for feature in feature_set
-                ]
-
-            all_input_ids = torch.tensor(
-                [f.input_ids for f in features], dtype=torch.long
-            )
-            all_input_mask = torch.tensor(
-                [f.input_mask for f in features], dtype=torch.long
-            )
-            all_segment_ids = torch.tensor(
-                [f.segment_ids for f in features], dtype=torch.long
-            )
-
-            if self.args.model_type == "layoutlm":
-                all_bboxes = torch.tensor(
-                    [f.bboxes for f in features], dtype=torch.long
-                )
-
-            if output_mode == "classification":
-                all_label_ids = torch.tensor(
-                    [f.label_id for f in features], dtype=torch.long
-                )
-            elif output_mode == "regression":
-                all_label_ids = torch.tensor(
-                    [f.label_id for f in features], dtype=torch.float
-                )
-
-            if self.args.model_type == "layoutlm":
-                dataset = TensorDataset(
-                    all_input_ids,
-                    all_input_mask,
-                    all_segment_ids,
-                    all_label_ids,
-                    all_bboxes,
-                )
-            else:
-                dataset = TensorDataset(
-                    all_input_ids, all_input_mask, all_segment_ids, all_label_ids
-                )
-
-            if args.sliding_window and evaluate:
-                return dataset, window_counts
-            else:
-                return dataset
+        ):
+            features = torch.load(cached_features_file)
+            if verbose:
+                logger.info(f" Features loaded from cache at {cached_features_file}")
         else:
-            dataset = ClassificationDataset(
+            if verbose:
+                logger.info(" Converting to features started. Cache is not used.")
+                if args.sliding_window:
+                    logger.info(" Sliding window enabled")
+
+            # If labels_map is defined, then labels need to be replaced with ints
+            if self.args.labels_map and not self.args.regression:
+                for example in examples:
+                    if multi_label:
+                        example.label = [self.args.labels_map[label] for label in example.label]
+                    else:
+                        example.label = self.args.labels_map[example.label]
+
+            features = convert_examples_to_features(
                 examples,
-                self.tokenizer,
-                self.args,
-                mode=mode,
+                args.max_seq_length,
+                tokenizer,
+                output_mode,
+                # XLNet has a CLS token at the end
+                cls_token_at_end=bool(args.model_type in ["xlnet"]),
+                cls_token=tokenizer.cls_token,
+                cls_token_segment_id=2 if args.model_type in ["xlnet"] else 0,
+                sep_token=tokenizer.sep_token,
+                # RoBERTa uses an extra separator b/w pairs of sentences,
+                # cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
+                sep_token_extra=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer"]),
+                # PAD on the left for XLNet
+                pad_on_left=bool(args.model_type in ["xlnet"]),
+                pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
+                pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,
+                process_count=process_count,
                 multi_label=multi_label,
-                output_mode=output_mode,
-                no_cache=no_cache,
+                silent=args.silent or silent,
+                use_multiprocessing=args.use_multiprocessing,
+                sliding_window=args.sliding_window,
+                flatten=not evaluate,
+                stride=args.stride,
+                add_prefix_space=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer"]),
+                # avoid padding in case of single example/online inferencing to decrease execution time
+                pad_to_max_length=bool(len(examples) > 1),
+                args=args,
             )
+            if verbose and args.sliding_window:
+                logger.info(f" {len(features)} features created from {len(examples)} samples.")
+
+            if not no_cache:
+                torch.save(features, cached_features_file)
+
+        if args.sliding_window and evaluate:
+            features = [
+                [feature_set] if not isinstance(feature_set, list) else feature_set for feature_set in features
+            ]
+            window_counts = [len(sample) for sample in features]
+            features = [feature for feature_set in features for feature in feature_set]
+
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+
+        if self.args.model_type == "layoutlm":
+            all_bboxes = torch.tensor([f.bboxes for f in features], dtype=torch.long)
+
+        if output_mode == "classification":
+            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+        elif output_mode == "regression":
+            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
+
+        if self.args.model_type == "layoutlm":
+            dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_bboxes)
+        else:
+            dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+
+        if args.sliding_window and evaluate:
+            return dataset, window_counts
+        else:
             return dataset
 
-    def compute_metrics(
-        self,
-        preds,
-        model_outputs,
-        labels,
-        eval_examples=None,
-        multi_label=False,
-        **kwargs,
-    ):
+    def compute_metrics(self, preds, labels, eval_examples=None, multi_label=False, **kwargs):
         """
         Computes the evaluation metrics for the model predictions.
 
         Args:
             preds: Model predictions
-            model_outputs: Model outputs
             labels: Ground truth labels
             eval_examples: List of examples on which evaluation was performed
             **kwargs: Additional metrics that should be used. Pass in the metrics as keyword arguments (name of metric: function to use). E.g. f1=sklearn.metrics.f1_score.
                         A metric function should take in two parameters. The first parameter will be the true labels, and the second parameter will be the predictions.
 
         Returns:
-            result: Dictionary containing evaluation results.
-            For non-binary classification, the dictionary format is: (Matthews correlation coefficient, tp, tn, fp, fn).
-            For binary classification, the dictionary format is: (Matthews correlation coefficient, tp, tn, fp, fn, AUROC, AUPRC).
+            result: Dictionary containing evaluation results. (Matthews correlation coefficient, tp, tn, fp, fn)
             wrong: List of InputExample objects corresponding to each incorrect prediction by the model
         """  # noqa: ignore flake8"
 
@@ -1809,25 +1335,17 @@ class STSTransformerModel:
 
         extra_metrics = {}
         for metric, func in kwargs.items():
-            if metric.startswith("prob_"):
-                extra_metrics[metric] = func(labels, model_outputs)
-            else:
-                extra_metrics[metric] = func(labels, preds)
+            extra_metrics[metric] = func(labels, preds)
 
         if multi_label:
             threshold_values = self.args.threshold if self.args.threshold else 0.5
             if isinstance(threshold_values, list):
                 mismatched = labels != [
-                    [
-                        self._threshold(pred, threshold_values[i])
-                        for i, pred in enumerate(example)
-                    ]
-                    for example in preds
+                    [self._threshold(pred, threshold_values[i]) for i, pred in enumerate(example)] for example in preds
                 ]
             else:
                 mismatched = labels != [
-                    [self._threshold(pred, threshold_values) for pred in example]
-                    for example in preds
+                    [self._threshold(pred, threshold_values) for pred in example] for example in preds
                 ]
         else:
             mismatched = labels != preds
@@ -1844,36 +1362,13 @@ class STSTransformerModel:
             return {**extra_metrics}, wrong
 
         mcc = matthews_corrcoef(labels, preds)
+
         if self.model.num_labels == 2:
             tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
-            if self.args.sliding_window:
-                return (
-                    {
-                        **{"mcc": mcc, "tp": tp, "tn": tn, "fp": fp, "fn": fn},
-                        **extra_metrics,
-                    },
-                    wrong,
-                )
-            else:
-                scores = np.array([softmax(element)[1] for element in model_outputs])
-                fpr, tpr, thresholds = roc_curve(labels, scores)
-                auroc = auc(fpr, tpr)
-                auprc = average_precision_score(labels, scores)
-                return (
-                    {
-                        **{
-                            "mcc": mcc,
-                            "tp": tp,
-                            "tn": tn,
-                            "fp": fp,
-                            "fn": fn,
-                            "auroc": auroc,
-                            "auprc": auprc,
-                        },
-                        **extra_metrics,
-                    },
-                    wrong,
-                )
+            return (
+                {**{"mcc": mcc, "tp": tp, "tn": tn, "fp": fp, "fn": fn}, **extra_metrics},
+                wrong,
+            )
         else:
             return {**{"mcc": mcc}, **extra_metrics}, wrong
 
@@ -1905,76 +1400,52 @@ class STSTransformerModel:
                 to_predict, return_tensors="pt", padding=True, truncation=True
             )
 
-            if self.args.model_type in ["bert", "xlnet", "albert", "layoutlm"]:
-                for i, (input_ids, attention_mask, token_type_ids) in enumerate(
-                    zip(
-                        model_inputs["input_ids"],
-                        model_inputs["attention_mask"],
-                        model_inputs["token_type_ids"],
-                    )
-                ):
-                    input_ids = input_ids.unsqueeze(0).detach().cpu().numpy()
-                    attention_mask = attention_mask.unsqueeze(0).detach().cpu().numpy()
-                    token_type_ids = token_type_ids.unsqueeze(0).detach().cpu().numpy()
-                    inputs_onnx = {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "token_type_ids": token_type_ids,
-                    }
-
-                    # Run the model (None = get all the outputs)
-                    output = self.model.run(None, inputs_onnx)
-
-                    preds[i] = output[0]
-
-            else:
-                for i, (input_ids, attention_mask) in enumerate(
+            for i, (input_ids, attention_mask) in enumerate(
                     zip(model_inputs["input_ids"], model_inputs["attention_mask"])
-                ):
-                    input_ids = input_ids.unsqueeze(0).detach().cpu().numpy()
-                    attention_mask = attention_mask.unsqueeze(0).detach().cpu().numpy()
-                    inputs_onnx = {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                    }
+            ):
+                input_ids = input_ids.unsqueeze(0).detach().cpu().numpy()
+                attention_mask = attention_mask.unsqueeze(0).detach().cpu().numpy()
+                inputs_onnx = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-                    # Run the model (None = get all the outputs)
-                    output = self.model.run(None, inputs_onnx)
+                # Run the model (None = get all the outputs)
+                output = self.model.run(None, inputs_onnx)
 
-                    preds[i] = output[0]
+                preds[i] = output[0]
+                # if preds is None:
+                #     preds = output[0]
+                # else:
+                #     preds = np.append(preds, output[0], axis=0)
 
             model_outputs = preds
             preds = np.argmax(preds, axis=1)
 
         else:
             self._move_model_to_device()
-            dummy_label = (
-                0
-                if not self.args.labels_map
-                else next(iter(self.args.labels_map.keys()))
-            )
-
-            if multi_label:
-                dummy_label = [dummy_label for i in range(self.num_labels)]
+            dummy_label = 0 if not self.args.labels_map else next(iter(self.args.labels_map.keys()))
 
             if args.n_gpu > 1:
                 model = torch.nn.DataParallel(model)
 
-            if isinstance(to_predict[0], list):
-                eval_examples = (
-                    *zip(*to_predict),
-                    [dummy_label for i in range(len(to_predict))],
-                )
+            if multi_label:
+                if isinstance(to_predict[0], list):
+                    eval_examples = [
+                        InputExample(i, text[0], text[1], [dummy_label for i in range(self.num_labels)])
+                        for i, text in enumerate(to_predict)
+                    ]
+                else:
+                    eval_examples = [
+                        InputExample(i, text, None, [dummy_label for i in range(self.num_labels)])
+                        for i, text in enumerate(to_predict)
+                    ]
             else:
-                eval_examples = (
-                    to_predict,
-                    [dummy_label for i in range(len(to_predict))],
-                )
-
+                if isinstance(to_predict[0], list):
+                    eval_examples = [
+                        InputExample(i, text[0], text[1], dummy_label) for i, text in enumerate(to_predict)
+                    ]
+                else:
+                    eval_examples = [InputExample(i, text, None, dummy_label) for i, text in enumerate(to_predict)]
             if args.sliding_window:
-                eval_dataset, window_counts = self.load_and_cache_examples(
-                    eval_examples, evaluate=True, no_cache=True
-                )
+                eval_dataset, window_counts = self.load_and_cache_examples(eval_examples, evaluate=True, no_cache=True)
                 preds = np.empty((len(eval_dataset), self.num_labels))
                 if multi_label:
                     out_label_ids = np.empty((len(eval_dataset), self.num_labels))
@@ -1986,9 +1457,7 @@ class STSTransformerModel:
                 )
 
             eval_sampler = SequentialSampler(eval_dataset)
-            eval_dataloader = DataLoader(
-                eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
-            )
+            eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
             if self.args.fp16:
                 from torch.cuda import amp
@@ -1997,38 +1466,19 @@ class STSTransformerModel:
                 model.eval()
                 preds = None
                 out_label_ids = None
-                for i, batch in enumerate(
-                    tqdm(
-                        eval_dataloader, disable=args.silent, desc="Running Prediction"
-                    )
-                ):
-                    # batch = tuple(t.to(self.device) for t in batch)
+                for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent, desc="Running Prediction")):
+                    # batch = tuple(t.to(device) for t in batch)
                     with torch.no_grad():
-                        inputs = self._get_inputs_dict(batch, no_hf=True)
+                        inputs = self._get_inputs_dict(batch)
 
                         if self.args.fp16:
                             with amp.autocast():
-                                outputs = self._calculate_loss(
-                                    model,
-                                    inputs,
-                                    loss_fct=self.loss_fct,
-                                    num_labels=self.num_labels,
-                                    args=self.args,
-                                )
+                                outputs = model(**inputs)
                                 tmp_eval_loss, logits = outputs[:2]
                         else:
-                            outputs = self._calculate_loss(
-                                model,
-                                inputs,
-                                loss_fct=self.loss_fct,
-                                num_labels=self.num_labels,
-                                args=self.args,
-                            )
+                            outputs = model(**inputs)
                             tmp_eval_loss, logits = outputs[:2]
-                        embedding_outputs, layer_hidden_states = (
-                            outputs[2][0],
-                            outputs[2][1:],
-                        )
+                        embedding_outputs, layer_hidden_states = outputs[2][0], outputs[2][1:]
 
                         if multi_label:
                             logits = logits.sigmoid()
@@ -2043,33 +1493,19 @@ class STSTransformerModel:
                         preds = logits.detach().cpu().numpy()
                         out_label_ids = inputs["labels"].detach().cpu().numpy()
                         all_layer_hidden_states = np.array(
-                            [
-                                state.detach().cpu().numpy()
-                                for state in layer_hidden_states
-                            ]
+                            [state.detach().cpu().numpy() for state in layer_hidden_states]
                         )
                         all_embedding_outputs = embedding_outputs.detach().cpu().numpy()
                     else:
                         preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-                        out_label_ids = np.append(
-                            out_label_ids,
-                            inputs["labels"].detach().cpu().numpy(),
-                            axis=0,
-                        )
+                        out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
                         all_layer_hidden_states = np.append(
                             all_layer_hidden_states,
-                            np.array(
-                                [
-                                    state.detach().cpu().numpy()
-                                    for state in layer_hidden_states
-                                ]
-                            ),
+                            np.array([state.detach().cpu().numpy() for state in layer_hidden_states]),
                             axis=1,
                         )
                         all_embedding_outputs = np.append(
-                            all_embedding_outputs,
-                            embedding_outputs.detach().cpu().numpy(),
-                            axis=0,
+                            all_embedding_outputs, embedding_outputs.detach().cpu().numpy(), axis=0
                         )
             else:
                 n_batches = len(eval_dataloader)
@@ -2078,26 +1514,14 @@ class STSTransformerModel:
                     # batch = tuple(t.to(device) for t in batch)
 
                     with torch.no_grad():
-                        inputs = self._get_inputs_dict(batch, no_hf=True)
+                        inputs = self._get_inputs_dict(batch)
 
                         if self.args.fp16:
                             with amp.autocast():
-                                outputs = self._calculate_loss(
-                                    model,
-                                    inputs,
-                                    loss_fct=self.loss_fct,
-                                    num_labels=self.num_labels,
-                                    args=self.args,
-                                )
+                                outputs = model(**inputs)
                                 tmp_eval_loss, logits = outputs[:2]
                         else:
-                            outputs = self._calculate_loss(
-                                model,
-                                inputs,
-                                loss_fct=self.loss_fct,
-                                num_labels=self.num_labels,
-                                args=self.args,
-                            )
+                            outputs = model(**inputs)
                             tmp_eval_loss, logits = outputs[:2]
 
                         if multi_label:
@@ -2110,15 +1534,16 @@ class STSTransformerModel:
                     nb_eval_steps += 1
 
                     start_index = self.args.eval_batch_size * i
-                    end_index = (
-                        start_index + self.args.eval_batch_size
-                        if i != (n_batches - 1)
-                        else len(eval_dataset)
-                    )
+                    end_index = start_index + self.args.eval_batch_size if i != (n_batches - 1) else len(eval_dataset)
                     preds[start_index:end_index] = logits.detach().cpu().numpy()
-                    out_label_ids[start_index:end_index] = (
-                        inputs["labels"].detach().cpu().numpy()
-                    )
+                    out_label_ids[start_index:end_index] = inputs["labels"].detach().cpu().numpy()
+
+                    # if preds is None:
+                    #     preds = logits.detach().cpu().numpy()
+                    #     out_label_ids = inputs["labels"].detach().cpu().numpy()
+                    # else:
+                    #     preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+                    #     out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
 
             eval_loss = eval_loss / nb_eval_steps
 
@@ -2129,10 +1554,7 @@ class STSTransformerModel:
                     window_ranges.append([count, count + n_windows])
                     count += n_windows
 
-                preds = [
-                    preds[window_range[0] : window_range[1]]
-                    for window_range in window_ranges
-                ]
+                preds = [preds[window_range[0]: window_range[1]] for window_range in window_ranges]
 
                 model_outputs = preds
 
@@ -2150,28 +1572,10 @@ class STSTransformerModel:
                 model_outputs = preds
             else:
                 model_outputs = preds
-                if multi_label:
-                    if isinstance(args.threshold, list):
-                        threshold_values = args.threshold
-                        preds = [
-                            [
-                                self._threshold(pred, threshold_values[i])
-                                for i, pred in enumerate(example)
-                            ]
-                            for example in preds
-                        ]
-                    else:
-                        preds = [
-                            [self._threshold(pred, args.threshold) for pred in example]
-                            for example in preds
-                        ]
-                else:
-                    preds = np.argmax(preds, axis=1)
+                preds = np.argmax(preds, axis=1)
 
         if self.args.labels_map and not self.args.regression:
-            inverse_labels_map = {
-                value: key for key, value in self.args.labels_map.items()
-            }
+            inverse_labels_map = {value: key for key, value in self.args.labels_map.items()}
             preds = [inverse_labels_map[pred] for pred in preds]
 
         if self.config.output_hidden_states:
@@ -2193,9 +1597,7 @@ class STSTransformerModel:
         if os.listdir(output_dir):
             raise ValueError(
                 "Output directory ({}) already exists and is not empty."
-                " Output directory for onnx conversion must be empty.".format(
-                    output_dir
-                )
+                " Output directory for onnx conversion must be empty.".format(output_dir)
             )
 
         onnx_model_name = os.path.join(output_dir, "onnx_model.onnx")
@@ -2217,17 +1619,6 @@ class STSTransformerModel:
         self.config.save_pretrained(output_dir)
         self.save_model_args(output_dir)
 
-    def _calculate_loss(self, model, inputs, loss_fct, num_labels, args):
-        outputs = model(**inputs)
-        # model outputs are always tuple in pytorch-transformers (see doc)
-        loss = outputs[0]
-        if loss_fct:
-            logits = outputs[1]
-            labels = inputs["labels"]
-
-            loss = loss_fct(logits.view(-1, num_labels), labels.view(-1))
-        return (loss, *outputs[1:])
-
     def _threshold(self, x, threshold):
         if x >= threshold:
             return 1
@@ -2236,29 +1627,19 @@ class STSTransformerModel:
     def _move_model_to_device(self):
         self.model.to(self.device)
 
-    def _get_inputs_dict(self, batch, no_hf=False):
-        if self.args.use_hf_datasets and not no_hf:
-            return {key: value.to(self.device) for key, value in batch.items()}
+    def _get_inputs_dict(self, batch):
         if isinstance(batch[0], dict):
-            inputs = {
-                key: value.squeeze(1).to(self.device) for key, value in batch[0].items()
-            }
+            inputs = {key: value.squeeze().to(self.device) for key, value in batch[0].items()}
             inputs["labels"] = batch[1].to(self.device)
         else:
             batch = tuple(t.to(self.device) for t in batch)
 
-            inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "labels": batch[3],
-            }
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
 
             # XLM, DistilBERT and RoBERTa don't use segment_ids
             if self.args.model_type != "distilbert":
                 inputs["token_type_ids"] = (
-                    batch[2]
-                    if self.args.model_type in ["bert", "xlnet", "albert", "layoutlm"]
-                    else None
+                    batch[2] if self.args.model_type in ["bert", "xlnet", "albert", "layoutlm"] else None
                 )
 
         if self.args.model_type == "layoutlm":
@@ -2270,11 +1651,47 @@ class STSTransformerModel:
         return {metric: values[-1] for metric, values in metric_values.items()}
 
     def _create_training_progress_scores(self, multi_label, **kwargs):
-        return collections.defaultdict(list)
+        extra_metrics = {key: [] for key in kwargs}
+        if multi_label:
+            training_progress_scores = {
+                "global_step": [],
+                "LRAP": [],
+                "train_loss": [],
+                "eval_loss": [],
+                **extra_metrics,
+            }
+        else:
+            if self.model.num_labels == 2:
+                training_progress_scores = {
+                    "global_step": [],
+                    "tp": [],
+                    "tn": [],
+                    "fp": [],
+                    "fn": [],
+                    "mcc": [],
+                    "train_loss": [],
+                    "eval_loss": [],
+                    **extra_metrics,
+                }
+            elif self.model.num_labels == 1:
+                training_progress_scores = {
+                    "global_step": [],
+                    "train_loss": [],
+                    "eval_loss": [],
+                    **extra_metrics,
+                }
+            else:
+                training_progress_scores = {
+                    "global_step": [],
+                    "mcc": [],
+                    "train_loss": [],
+                    "eval_loss": [],
+                    **extra_metrics,
+                }
 
-    def save_model(
-        self, output_dir=None, optimizer=None, scheduler=None, model=None, results=None
-    ):
+        return training_progress_scores
+
+    def save_model(self, output_dir=None, optimizer=None, scheduler=None, model=None, results=None):
         if not output_dir:
             output_dir = self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -2286,12 +1703,8 @@ class STSTransformerModel:
             self.tokenizer.save_pretrained(output_dir)
             torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
             if optimizer and scheduler and self.args.save_optimizer_and_scheduler:
-                torch.save(
-                    optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt")
-                )
-                torch.save(
-                    scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt")
-                )
+                torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
             self.save_model_args(output_dir)
 
         if results:
